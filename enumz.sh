@@ -24,7 +24,7 @@ if [ -z "$1" ]; then
     echo -e "${YELLOW}Example:"
     echo -e "  $0 example.com"
     echo -e "  $0 https://example.com/v2/bb/hh"
-    echo -e "  $0 subdomains.txt${NC}"
+    echo -e "  $0 example.com subdomains.txt${NC}"
     exit 1
 fi
 
@@ -48,7 +48,35 @@ mkdir -p "$OUTDIR"
 LOGFILE="$OUTDIR/enumz.log"
 exec > >(tee -a "$LOGFILE") 2>&1
 
-WORDLIST="/root/SecLists/Discovery/DNS/subdomains-top1million-110000.txt"
+# ==========================
+# Utility Functions
+# ==========================
+find_wordlist() {
+    local primary="$1"
+    local fallbacks=("$@")
+
+    for wordlist in "${fallbacks[@]}"; do
+        if [ -f "$wordlist" ]; then
+            echo "$wordlist"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Simple rate limiting
+rate_limit() {
+    sleep 0.5  # 500ms delay between requests
+}
+
+# Main wordlist with fallbacks
+WORDLIST=$(find_wordlist \
+    "/root/SecLists/Discovery/DNS/subdomains-top1million-110000.txt" \
+    "/usr/share/wordlists/SecLists/Discovery/DNS/subdomains-top1million-110000.txt" \
+    "/opt/SecLists/Discovery/DNS/subdomains-top1million-110000.txt" \
+    "/home/kali/SecLists/Discovery/DNS/subdomains-top1million-110000.txt" \
+    "/usr/share/wordlists/dnsmap.txt" \
+    "/usr/share/wordlists/subdomains.txt")
 
 # ==========================
 # Validate Dependencies
@@ -77,11 +105,12 @@ done
 # Validate Wordlists
 # ==========================
 echo -e "${BLUE}[+] Checking wordlists...${NC}"
-if [ ! -f "$WORDLIST" ]; then
-    echo -e "${RED}[!] Wordlist not found: $WORDLIST${NC}"
+if [ -z "$WORDLIST" ]; then
+    echo -e "${RED}[!] No suitable subdomain wordlist found.${NC}"
+    echo -e "${YELLOW}[!] Please install SecLists or provide a custom wordlist.${NC}"
     exit 1
 fi
-echo -e "${GREEN}[+] Wordlist found.${NC}"
+echo -e "${GREEN}[+] Using wordlist: $WORDLIST${NC}"
 sleep 2
 
 # ==========================
@@ -152,7 +181,7 @@ else
     sleep 2
     ffuf -u http://FUZZ.$BASE_DOMAIN -w "$WORDLIST" -mc 200,301,302,403,401 -of csv -o "$OUTDIR/ffufraw.csv" -t 50 -v
     if [ -f "$OUTDIR/ffufraw.csv" ]; then
-        awk -F ',' 'NR>1 {print $1"."ENVIRON["BASE_DOMAIN"]}' "$OUTDIR/ffufraw.csv" > "$OUTDIR/ffuf.txt"
+        awk -F ',' -v domain="$BASE_DOMAIN" 'NR>1 {print $1"."domain}' "$OUTDIR/ffufraw.csv" > "$OUTDIR/ffuf.txt"
         echo -e "${GREEN}[+] Ffuf found: $(wc -l < "$OUTDIR/ffuf.txt") subs${NC}"
     else
         echo -e "${YELLOW}[!] Ffuf failed to produce output.${NC}"
@@ -166,7 +195,7 @@ fi
 # ==========================
 # Make full URLs list for scanning with paths
 # ==========================
-PATH_PART=$(echo "$INPUT" | grep -oP '(?<=^https?://[^/]+).*$')
+PATH_PART=$(echo "$INPUT" | sed -n 's|^https\?://[^/]*\(.*\)$|\1|p')
 if [ -z "$PATH_PART" ]; then
     PATH_PART="/"
 fi
@@ -223,7 +252,7 @@ set_checkpoint "crawling"
 # ==========================
 skip_to_phase "sensitive files" || { echo -e "${YELLOW}[!] Skipping Sensitive Files Phase (already completed)${NC}"; }
 echo -e "${BLUE}[+] Searching for sensitive files...${NC}"
-grep -E "\.(xls|xml|xlsx|json|pdf|sql|doc|docx|pptx|txt|zip|tar\.gz|tgz|bak|7z|rar|log|cache|secret|db|backup|yml|gz|config|csv|yaml|md|md5)" "$OUTDIR/allsubs.txt" | tee "$OUTDIR/sensitive_files.txt"
+grep -E "\.(xls|xml|xlsx|json|pdf|sql|doc|docx|pptx|txt|zip|tar\.gz|tgz|bak|7z|rar|log|cache|secret|db|backup|yml|gz|config|csv|yaml|md|md5)" "$OUTDIR/urls.txt" | tee "$OUTDIR/sensitive_files.txt"
 echo -e "${GREEN}[+] Sensitive files found: $(wc -l < "$OUTDIR/sensitive_files.txt")${NC}"
 set_checkpoint "sensitive files"
 
@@ -250,6 +279,7 @@ while read -r url; do
     fi
     echo -e "${YELLOW}[*] Scanning: $url${NC}"
     arjun -u "$url" -oT - >> "$OUTDIR/arjun_params.txt" || echo -e "${RED}[!] Arjun failed for: $url${NC}"
+    rate_limit
 done < "$OUTDIR/livesubs.txt"
 
 echo -e "${GREEN}[+] Arjun params saved to arjun_params.txt${NC}"
@@ -267,7 +297,17 @@ while read -r url; do
         SKIP_CURRENT=0
         break
     fi
-    dirb "$url" -w /usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt -o "$OUTDIR/dirb_$(echo "$url" | sed 's/[^a-zA-Z0-9]/_/g').log"
+    DIRB_WORDLIST=$(find_wordlist \
+        "/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt" \
+        "/usr/share/wordlists/dirb/common.txt" \
+        "/usr/share/wordlists/dirb/big.txt" \
+        "/usr/share/wordlists/SecLists/Discovery/Web-Content/directory-list-2.3-medium.txt")
+    if [ -n "$DIRB_WORDLIST" ]; then
+        dirb "$url" -w "$DIRB_WORDLIST" -o "$OUTDIR/dirb_$(echo "$url" | sed 's/[^a-zA-Z0-9]/_/g').log"
+    else
+        echo -e "${YELLOW}[!] DirBuster wordlist not found: $DIRB_WORDLIST${NC}"
+        echo -e "${YELLOW}[!] Skipping DirBuster for: $url${NC}"
+    fi
 done < "$OUTDIR/livesubs.txt"
 
 echo -e "${BLUE}[+] Running FFUF for directories/files...${NC}"
@@ -278,12 +318,24 @@ while read -r url; do
         SKIP_CURRENT=0
         break
     fi
-    ffuf -w /root/SecLists/Discovery/Web-Content/common.txt -u "$url/FUZZ" \
+    FFUF_WORDLIST=$(find_wordlist \
+        "/root/SecLists/Discovery/Web-Content/common.txt" \
+        "/usr/share/wordlists/SecLists/Discovery/Web-Content/common.txt" \
+        "/opt/SecLists/Discovery/Web-Content/common.txt" \
+        "/home/kali/SecLists/Discovery/Web-Content/common.txt" \
+        "/usr/share/wordlists/dirb/common.txt" \
+        "/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt")
+    if [ -n "$FFUF_WORDLIST" ]; then
+        ffuf -w "$FFUF_WORDLIST" -u "$url/FUZZ" \
         -fc 400,401,402,403,404,429,500,501,502,503 -recursion -recursion-depth 2 \
         -e .html,.php,.txt,.pdf,.js,.css,.zip,.bak,.old,.log,.json,.xml,.config,.env,.asp,.aspx,.jsp,.gz,.tar,.sql,.db \
         -ac -c -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0" \
         -H "X-Forwarded-For: 127.0.0.1" -H "X-Originating-IP: 127.0.0.1" -H "X-Forwarded-Host: localhost" \
         -t 100 -r -o "$OUTDIR/ffuf_dir_$(echo "$url" | sed 's/[^a-zA-Z0-9]/_/g').json"
+    else
+        echo -e "${YELLOW}[!] FFUF wordlist not found: $FFUF_WORDLIST${NC}"
+        echo -e "${YELLOW}[!] Skipping FFUF content discovery for: $url${NC}"
+    fi
 done < "$OUTDIR/livesubs.txt"
 echo -e "${GREEN}[+] Content discovery completed. Check dirb and ffuf outputs.${NC}"
 set_checkpoint "content discovery"
@@ -293,9 +345,17 @@ set_checkpoint "content discovery"
 # ==========================
 skip_to_phase "xss" || { echo -e "${YELLOW}[!] Skipping xss scan Phase (already completed)${NC}"; }
 echo -e "${BLUE}[+] Running FFUF for XSS testing (using Arjun params)...${NC}"
-XSSWORDLIST="/root/wordlists/xss-payloads.txt"
+XSSWORDLIST=$(find_wordlist \
+    "/root/SecLists/Fuzzing/XSS/human-friendly/XSS-payloadbox.txt" \
+    "/usr/share/wordlists/xss-payloads.txt" \
+    "/opt/wordlists/xss-payloads.txt" \
+    "/home/kali/wordlists/xss-payloads.txt" \
+    "/usr/share/wordlists/SecLists/Fuzzing/XSS/XSS-TestCases.txt")
 
-if [ -s "$OUTDIR/arjun_params.txt" ]; then
+if [ -z "$XSSWORDLIST" ]; then
+    echo -e "${RED}[!] XSS wordlist not found: $XSSWORDLIST${NC}"
+    echo -e "${YELLOW}[!] Skipping XSS fuzzing.${NC}"
+elif [ -s "$OUTDIR/arjun_params.txt" ]; then
     while read -r url; do
         if [ "$SKIP_CURRENT" -eq 1 ]; then
             echo -e "${YELLOW}[!] Skipping rest of this phase due to Ctrl+C${NC}"
@@ -303,6 +363,7 @@ if [ -s "$OUTDIR/arjun_params.txt" ]; then
             break
         fi
         ffuf -u "${url}FUZZ" -w "$XSSWORDLIST" -mr "<script>alert('XSS')</script>" -t 50 -c -ac -of json -o "$OUTDIR/ffuf_xss_$(echo "$url" | sed 's/[^a-zA-Z0-9]/_/g').json"
+        rate_limit
     done < "$OUTDIR/arjun_params.txt"
     echo -e "${GREEN}[+] XSS fuzzing completed. Results saved.${NC}"
 else
@@ -315,9 +376,17 @@ set_checkpoint "xss"
 # ==========================
 skip_to_phase "lfi" || { echo -e "${YELLOW}[!] Skipping LFI scan Phase (already completed)${NC}"; }
 echo -e "${BLUE}[+] Running FFUF for LFI testing (using Arjun params)...${NC}"
-LFIWORDLIST="/root/wordlists/offensive payloads/LFI payload.txt"
+LFIWORDLIST=$(find_wordlist \
+    "/root/SecLists/Fuzzing/LFI/LFI-linux-and-windows_by-1N3@CrowdShield.txt" \
+    "/usr/share/wordlists/offensive-payloads/LFI-payload.txt" \
+    "/opt/wordlists/LFI-payload.txt" \
+    "/home/kali/wordlists/LFI-payload.txt" \
+    "/usr/share/wordlists/SecLists/Fuzzing/LFI/LFI-Jhaddix.txt")
 
-if [ -s "$OUTDIR/arjun_params.txt" ]; then
+if [ -z "$LFIWORDLIST" ]; then
+    echo -e "${RED}[!] LFI wordlist not found: $LFIWORDLIST${NC}"
+    echo -e "${YELLOW}[!] Skipping LFI fuzzing.${NC}"
+elif [ -s "$OUTDIR/arjun_params.txt" ]; then
     while read -r url; do
         if [ "$SKIP_CURRENT" -eq 1 ]; then
             echo -e "${YELLOW}[!] Skipping rest of this phase due to Ctrl+C${NC}"
@@ -325,6 +394,7 @@ if [ -s "$OUTDIR/arjun_params.txt" ]; then
             break
         fi
         ffuf -u "${url}FUZZ" -w "$LFIWORDLIST" -mr "root:" -t 50 -c -ac -of json -o "$OUTDIR/ffuf_lfi_$(echo "$url" | sed 's/[^a-zA-Z0-9]/_/g').json"
+        rate_limit
     done < "$OUTDIR/arjun_params.txt"
     echo -e "${GREEN}[+] LFI fuzzing completed. Results saved.${NC}"
 else
@@ -407,8 +477,12 @@ while read -r url; do
     for endpoint in "${CORS_ENDPOINTS[@]}"; do
         full_url="${url}${endpoint}"
         echo -e "${YELLOW}[*] Checking CORS on: $full_url${NC}"
-        curl -s -X OPTIONS -H "Origin: http://example.com" -H "Access-Control-Request-Method: GET" -I "$full_url" \
-            | grep -i -e "access-control-allow-origin" -e "access-control-allow-methods" -e "access-control-allow-credentials"
+        cors_result=$(curl -s -X OPTIONS -H "Origin: http://example.com" -H "Access-Control-Request-Method: GET" -I "$full_url" \
+            | grep -i -e "access-control-allow-origin" -e "access-control-allow-methods" -e "access-control-allow-credentials")
+        if [ -n "$cors_result" ]; then
+            echo "$full_url: $cors_result" >> "$OUTDIR/cors_results.txt"
+        fi
+        rate_limit
     done
 done < "$OUTDIR/livesubs.txt"
 echo -e "${GREEN}[+] CORS testing finished.${NC}"
@@ -435,7 +509,13 @@ if [ -s "$OUTDIR/arjun_params.txt" ]; then
         fi
         test_url="${purl}${SSRF_PAYLOAD}"
         echo -e "${YELLOW}[*] SSRF test (Arjun): $test_url${NC}"
-        curl -s -L "$test_url" -H "Host: 169.254.169.254" -H "X-Forwarded-Host: 169.254.169.254" -H "X-Forwarded-For: 169.254.169.254" -H "X-Client-IP: 169.254.169.254" | head -n 10
+        ssrf_result=$(curl -s -L "$test_url" -H "Host: 169.254.169.254" -H "X-Forwarded-Host: 169.254.169.254" -H "X-Forwarded-For: 169.254.169.254" -H "X-Client-IP: 169.254.169.254" | head -n 10)
+        if [ -n "$ssrf_result" ] && [[ "$ssrf_result" =~ (ami-id|instance-id|security-groups) ]]; then
+            echo "POTENTIAL SSRF: $test_url" >> "$OUTDIR/ssrf_results.txt"
+            echo "$ssrf_result" >> "$OUTDIR/ssrf_results.txt"
+            echo "---" >> "$OUTDIR/ssrf_results.txt"
+        fi
+        rate_limit
     done < "$OUTDIR/arjun_params.txt"
 else
     echo -e "${YELLOW}[!] No Arjun params; skipping Arjun-based SSRF tests.${NC}"
@@ -450,7 +530,13 @@ if [ -s "$OUTDIR/ssrf_candidates.txt" ]; then
         fi
         injected=$(echo "$cand" | sed -E "s/(url=|uri=|redirect=|next=|data=|path=|dest=|proxy=|file=|img=|out=|continue=)[^&#]*/\1$SSRF_PAYLOAD_ESC/gI")
         echo -e "${YELLOW}[*] SSRF test (candidates): $injected${NC}"
-        curl -s -L "$injected" -H "Host: 169.254.169.254" -H "X-Forwarded-Host: 169.254.169.254" -H "X-Forwarded-For: 169.254.169.254" -H "X-Client-IP: 169.254.169.254" | head -n 10
+        ssrf_result=$(curl -s -L "$injected" -H "Host: 169.254.169.254" -H "X-Forwarded-Host: 169.254.169.254" -H "X-Forwarded-For: 169.254.169.254" -H "X-Client-IP: 169.254.169.254" | head -n 10)
+        if [ -n "$ssrf_result" ] && [[ "$ssrf_result" =~ (ami-id|instance-id|security-groups) ]]; then
+            echo "POTENTIAL SSRF: $injected" >> "$OUTDIR/ssrf_results.txt"
+            echo "$ssrf_result" >> "$OUTDIR/ssrf_results.txt"
+            echo "---" >> "$OUTDIR/ssrf_results.txt"
+        fi
+        rate_limit
     done < "$OUTDIR/ssrf_candidates.txt"
 else
     echo -e "${YELLOW}[!] No SSRF candidates from crawl; skipping candidate-based SSRF tests.${NC}"
